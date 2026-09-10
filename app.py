@@ -1,14 +1,19 @@
 import io
 import json
+import base64
 import threading
 import uuid
 
 import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from core import descriptive_analysis, train_model
+from core import clean_commodity_series, descriptive_analysis, train_model
 
 app = Flask(__name__)
 CORS(app)
@@ -72,6 +77,29 @@ def _resolve_upload_columns(df: pd.DataFrame, date_column: str, commodity_column
     return date_column, commodity_column
 
 
+def _render_lag_chart(df: pd.DataFrame, commodity_column: str) -> str:
+    prices = clean_commodity_series(df, commodity_column).dropna()
+    lag_data = pd.DataFrame({"y": prices, "lag_1": prices.shift(1)}).dropna()
+
+    figure, axis = plt.subplots(figsize=(9, 5), dpi=120)
+    if not lag_data.empty:
+        x = lag_data["lag_1"]
+        y = lag_data["y"]
+        axis.scatter(x, y, alpha=0.45, color="#1976B9")
+        if len(lag_data) >= 2 and x.nunique() > 1:
+            coefficient = np.polyfit(x, y, 1)
+            trend_x = np.linspace(x.min(), x.max(), 200)
+            axis.plot(trend_x, np.polyval(coefficient, trend_x), color="#1976B9", linewidth=2)
+    axis.set_xlabel("Harga t-1")
+    axis.set_ylabel("Harga t")
+    axis.grid(alpha=0.20)
+    figure.tight_layout()
+    output = io.BytesIO()
+    figure.savefig(output, format="png", bbox_inches="tight")
+    plt.close(figure)
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
 # ======================================================================
 # GET COLUMNS ONLY
 # POST /columns
@@ -91,31 +119,22 @@ def get_columns():
             df = pd.read_excel(file)
         else:
             return jsonify({"error": "Format tidak didukung."}), 400
-
-        date_column = None
-        date_values = None
-        for column in df.columns:
-            parsed = pd.to_datetime(df[column], dayfirst=True, errors="coerce")
-            if parsed.notna().mean() >= 0.8:
-                date_column = column
-                date_values = parsed.dropna()
-                break
-
-        preview = json.loads(
-            df.head(10).to_json(orient="records", date_format="iso")
-        )
         response = {
             "columns": list(df.columns),
-            "preview": preview,
+            "preview": json.loads(df.head(10).to_json(orient="records", date_format="iso")),
             "preview_rows": len(df.head(10)),
             "total_rows": len(df),
         }
-        if date_column and date_values is not None:
-            response["date_column"] = date_column
-            response["date_range"] = {
-                "start": str(date_values.min().date()),
-                "end": str(date_values.max().date()),
-            }
+        for column in df.columns:
+            parsed = pd.to_datetime(df[column], dayfirst=True, errors="coerce")
+            if parsed.notna().mean() >= 0.8:
+                response["date_column"] = column
+                values = parsed.dropna()
+                response["date_range"] = {
+                    "start": str(values.min().date()),
+                    "end": str(values.max().date()),
+                }
+                break
         return jsonify(response)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -170,12 +189,14 @@ def upload():
             df = df[df[date_column].dt.date <= pd.Timestamp(end_date).date()]
 
         df = df.reset_index(drop=True)
+        lag_chart = _render_lag_chart(df, commodity_column)
 
         session_id = str(uuid.uuid4())
         _set_store(session_id, {
             "df": df.to_json(date_format="iso"),
             "date_column": date_column,
             "commodity_column": commodity_column,
+            "lag_chart_base64": lag_chart,
         })
 
         return jsonify({
@@ -187,6 +208,7 @@ def upload():
                 "start": str(df[date_column].min().date()),
                 "end": str(df[date_column].max().date()),
             },
+            "lag_chart_base64": lag_chart,
         })
 
     except Exception as e:
