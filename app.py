@@ -15,6 +15,7 @@ CORS(app)
 # In-memory store: session_id -> data
 _store: dict = {}
 _lock = threading.Lock()
+_PLACEHOLDER_COLUMNS = {"_dummy_", "dummy", ""}
 
 
 def _get_store(session_id: str) -> dict:
@@ -25,6 +26,73 @@ def _get_store(session_id: str) -> dict:
 def _set_store(session_id: str, data: dict):
     with _lock:
         _store[session_id] = data
+
+
+def _resolve_upload_columns(df: pd.DataFrame, date_column: str, commodity_column: str):
+    """Resolve placeholder column names sent by older clients."""
+    if date_column not in _PLACEHOLDER_COLUMNS and commodity_column not in _PLACEHOLDER_COLUMNS:
+        return date_column, commodity_column
+
+    date_candidates = []
+    for column in df.columns:
+        parsed = pd.to_datetime(df[column], dayfirst=True, errors="coerce")
+        if parsed.notna().mean() >= 0.8:
+            date_candidates.append(column)
+
+    date_column = date_column if date_column not in _PLACEHOLDER_COLUMNS else (
+        date_candidates[0] if date_candidates else None
+    )
+
+    commodity_candidates = []
+    for column in df.columns:
+        if column == date_column:
+            continue
+        cleaned = (
+            df[column]
+            .astype(str)
+            .str.replace("Rp", "", regex=False)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+            .str.strip()
+        )
+        if pd.to_numeric(cleaned, errors="coerce").notna().mean() >= 0.8:
+            commodity_candidates.append(column)
+
+    commodity_column = commodity_column if commodity_column not in _PLACEHOLDER_COLUMNS else (
+        commodity_candidates[0] if commodity_candidates else None
+    )
+
+    if not date_column or not commodity_column:
+        raise ValueError(
+            "Kolom tanggal dan harga tidak dapat dideteksi otomatis. "
+            "Pilih kolom tanggal dan kolom harga dari dataset."
+        )
+
+    return date_column, commodity_column
+
+
+# ======================================================================
+# GET COLUMNS ONLY
+# POST /columns
+# Form-data: file (CSV/Excel)
+# ======================================================================
+
+@app.route("/columns", methods=["POST"])
+def get_columns():
+    if "file" not in request.files:
+        return jsonify({"error": "File tidak ditemukan."}), 400
+    file = request.files["file"]
+    try:
+        filename = file.filename.lower()
+        if filename.endswith(".csv"):
+            df = pd.read_csv(file, nrows=5)
+        elif filename.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(file, nrows=5)
+        else:
+            return jsonify({"error": "Format tidak didukung."}), 400
+        return jsonify({"columns": list(df.columns)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ======================================================================
@@ -54,6 +122,10 @@ def upload():
             df = pd.read_excel(file)
         else:
             return jsonify({"error": "Format file tidak didukung. Gunakan CSV atau Excel."}), 400
+
+        date_column, commodity_column = _resolve_upload_columns(
+            df, date_column, commodity_column
+        )
 
         if date_column not in df.columns:
             return jsonify({"error": f"Kolom '{date_column}' tidak ditemukan."}), 400
