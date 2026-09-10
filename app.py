@@ -1,4 +1,5 @@
 import io
+import json
 import threading
 import uuid
 
@@ -85,12 +86,37 @@ def get_columns():
     try:
         filename = file.filename.lower()
         if filename.endswith(".csv"):
-            df = pd.read_csv(file, nrows=5)
+            df = pd.read_csv(file)
         elif filename.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(file, nrows=5)
+            df = pd.read_excel(file)
         else:
             return jsonify({"error": "Format tidak didukung."}), 400
-        return jsonify({"columns": list(df.columns)})
+
+        date_column = None
+        date_values = None
+        for column in df.columns:
+            parsed = pd.to_datetime(df[column], dayfirst=True, errors="coerce")
+            if parsed.notna().mean() >= 0.8:
+                date_column = column
+                date_values = parsed.dropna()
+                break
+
+        preview = json.loads(
+            df.head(10).to_json(orient="records", date_format="iso")
+        )
+        response = {
+            "columns": list(df.columns),
+            "preview": preview,
+            "preview_rows": len(df.head(10)),
+            "total_rows": len(df),
+        }
+        if date_column and date_values is not None:
+            response["date_column"] = date_column
+            response["date_range"] = {
+                "start": str(date_values.min().date()),
+                "end": str(date_values.max().date()),
+            }
+        return jsonify(response)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
